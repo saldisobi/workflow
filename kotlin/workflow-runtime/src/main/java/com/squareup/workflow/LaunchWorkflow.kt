@@ -15,18 +15,24 @@
  */
 package com.squareup.workflow
 
+import com.squareup.workflow.diagnostic.WorkflowDiagnosticListener
 import com.squareup.workflow.internal.RealWorkflowLoop
 import com.squareup.workflow.internal.WorkflowLoop
+import com.squareup.workflow.internal.WorkflowRunner
 import com.squareup.workflow.internal.id
 import com.squareup.workflow.internal.unwrapCancellationCause
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart.ATOMIC
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BroadcastChannel
 import kotlinx.coroutines.channels.ConflatedBroadcastChannel
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
@@ -96,6 +102,10 @@ internal typealias Configurator <O, R, T> = CoroutineScope.(
  *
  * @return The value returned by [beforeStart].
  */
+@Deprecated(
+    "Use launchWorkflowIn2",
+    replaceWith = ReplaceWith("launchWorkflowIn2")
+)
 fun <PropsT, OutputT : Any, RenderingT, RunnerT> launchWorkflowIn(
   scope: CoroutineScope,
   workflow: Workflow<PropsT, OutputT, RenderingT>,
@@ -111,6 +121,52 @@ fun <PropsT, OutputT : Any, RenderingT, RunnerT> launchWorkflowIn(
     initialState = null,
     beforeStart = beforeStart
 )
+
+@OptIn(ExperimentalCoroutinesApi::class, VeryExperimentalWorkflow::class)
+fun <PropsT, OutputT : Any, RenderingT> launchWorkflowIn2(
+  scope: CoroutineScope,
+  workflow: Workflow<PropsT, OutputT, RenderingT>,
+  props: StateFlow<PropsT>,
+  initialSnapshot: Snapshot? = null,
+  diagnosticListener: WorkflowDiagnosticListener? = null,
+  onOutput: suspend (OutputT) -> Unit
+): StateFlow<RenderingAndSnapshot<RenderingT>> {
+  val runner = WorkflowRunner(scope, workflow, props, initialSnapshot, diagnosticListener)
+
+  // The runtime started event must be emitted before the first render pass.
+  diagnosticListener?.onRuntimeStarted(scope, workflow.id().typeDebugString)
+  val renderingsAndSnapshots = MutableStateFlow(
+      try {
+        runner.nextRendering()
+      } catch (e: Throwable) {
+        diagnosticListener?.onRuntimeStopped()
+        throw e
+      }
+  )
+
+  // Launch atomically so the finally block is ran even if the scope is cancelled before the
+  // coroutine starts executing.
+  scope.launch(start = ATOMIC) {
+    try {
+      // Props is a StateFlow, it must immediately produce an item. Consume that item here, but
+      // update currentProps in case the value changed since it was read in init.
+      runner.consumeNextProps()
+
+      while (true) {
+        coroutineContext.ensureActive()
+        val output = runner.nextOutput()
+        // After receiving an output, the next render pass must be done before emitting that output,
+        // so that the workflow states appear consistent to observers of the outputs and renderings.
+        renderingsAndSnapshots.value = runner.nextRendering()
+        output?.let { onOutput(it) }
+      }
+    } finally {
+      diagnosticListener?.onRuntimeStopped()
+    }
+  }
+
+  return renderingsAndSnapshots
+}
 
 @OptIn(
     ExperimentalCoroutinesApi::class,

@@ -26,7 +26,9 @@ import com.squareup.workflow.diagnostic.WorkflowDiagnosticListener
 import com.squareup.workflow.ui.WorkflowRunner.Config
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flowOf
 
 /**
@@ -40,7 +42,8 @@ interface WorkflowRunner<out OutputT : Any> {
   /**
    * A stream of the rendering values emitted by the running [Workflow].
    */
-  val renderings: Flow<Any>
+  @OptIn(ExperimentalCoroutinesApi::class)
+  val renderings: StateFlow<Any>
 
   /**
    * Returns the first (and only) [OutputT] value emitted by the workflow. Throws the cancellation

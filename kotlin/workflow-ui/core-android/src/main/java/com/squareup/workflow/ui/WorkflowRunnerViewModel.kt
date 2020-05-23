@@ -20,27 +20,25 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistry.SavedStateProvider
+import com.squareup.workflow.RenderingAndSnapshot
 import com.squareup.workflow.Snapshot
-import com.squareup.workflow.WorkflowSession
-import com.squareup.workflow.launchWorkflowIn
+import com.squareup.workflow.launchWorkflowIn2
 import com.squareup.workflow.ui.WorkflowRunner.Config
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.async
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.onEach
-import kotlinx.coroutines.launch
 import org.jetbrains.annotations.TestOnly
 
 internal class WorkflowRunnerViewModel<OutputT : Any>(
   private val scope: CoroutineScope,
-  private val session: WorkflowSession<OutputT, Any>
+  private val result: Deferred<OutputT>,
+  private val renderingsAndSnapshots: StateFlow<RenderingAndSnapshot<Any>>
 ) : ViewModel(), WorkflowRunner<OutputT>, SavedStateProvider {
 
   internal class Factory<PropsT, OutputT : Any>(
@@ -54,43 +52,35 @@ internal class WorkflowRunnerViewModel<OutputT : Any>(
 
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
       val config = configure()
-      return launchWorkflowIn(
-          CoroutineScope(config.dispatcher), config.workflow, config.props, snapshot
-      ) { session ->
-        session.diagnosticListener = config.diagnosticListener
-        @Suppress("UNCHECKED_CAST")
-        WorkflowRunnerViewModel(this, session).apply {
-          savedStateRegistry.registerSavedStateProvider(BUNDLE_KEY, this)
-        } as T
-      }
-    }
-  }
+      // TODO this will always fail, do it for real.
+      val props = config.props as StateFlow<PropsT>
+      val scope = CoroutineScope(config.dispatcher)
+      val result = CompletableDeferred<OutputT>(parent = scope.coroutineContext[Job])
 
-  private val result = scope.async {
-    session.outputs.first()
+      val renderingsAndSnapshots = launchWorkflowIn2(
+          scope, config.workflow, props,
+          initialSnapshot = snapshot,
+          diagnosticListener = config.diagnosticListener
+      ) { output ->
+        result.complete(output)
+        // Cancel the entire workflow runtime after the first output is emitted.
+        scope.cancel(CancellationException("WorkflowRunnerViewModel delivered result"))
+      }
+
+      @Suppress("UNCHECKED_CAST")
+      return WorkflowRunnerViewModel(scope, result, renderingsAndSnapshots).also {
+        savedStateRegistry.registerSavedStateProvider(BUNDLE_KEY, it)
+      } as T
+    }
   }
 
   override suspend fun awaitResult(): OutputT = result.await()
 
-  init {
-    @Suppress("EXPERIMENTAL_API_USAGE")
-    session.renderingsAndSnapshots
-        .map { it.snapshot }
-        .onEach { lastSnapshot = it }
-        .launchIn(scope)
-
-    // Cancel the entire workflow runtime after the first output is emitted.
-    // Use the Unconfined dispatcher to ensure the cancellation happens as immediately as possible.
-    scope.launch(Dispatchers.Unconfined) {
-      result.join()
-      scope.cancel(CancellationException("WorkflowRunnerViewModel delivered result"))
-    }
-  }
-
-  private var lastSnapshot: Snapshot = Snapshot.EMPTY
+  private val lastSnapshot: Snapshot get() = renderingsAndSnapshots.value.snapshot
 
   @OptIn(ExperimentalCoroutinesApi::class)
-  override val renderings: Flow<Any> = session.renderingsAndSnapshots
+  override val renderings: StateFlow<Any> = renderingsAndSnapshots
+      // TODO state-friendly map
       .map { it.rendering }
 
   override fun onCleared() {
